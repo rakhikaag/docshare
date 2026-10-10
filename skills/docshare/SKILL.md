@@ -19,6 +19,7 @@ Windows the switches are PowerShell style (`-Json`, `-Raw`, `-MakeRoom`).
 ```bash
 docshare report.pdf                 # prints the share URL
 docshare a.log b.log c.png          # one URL per line, in order
+docshare ./build/                   # a directory uploads as build.zip
 some-cmd 2>&1 | docshare - -n build.log   # upload piped output
 docshare --raw notes.md             # URL with ?raw=1, for another agent to read
 docshare --json dist.zip            # {"id","url","rawUrl","filename","size","expiresAt"}

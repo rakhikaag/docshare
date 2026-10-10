@@ -1,6 +1,7 @@
 # docshare — upload files to a docshare instance and manage your uploads.
 #
-#   .\upload.ps1 [options] <file|->...     upload; prints one URL per file
+#   .\upload.ps1 [options] <file|dir|->... upload; prints one URL per file
+#                                          (a directory uploads as <dir>.zip)
 #   .\upload.ps1 ls [-Json]                list your uploads (newest first)
 #   .\upload.ps1 rm <url|id>... | rm -All  delete uploads
 #   .\upload.ps1 usage [-Json]             daily quota and service storage
@@ -222,10 +223,36 @@ function Send-File($Path, $FileName) {
   }
 }
 
+# Zip a directory to a temp folder and return the zip's path. The archive keeps
+# the folder as its top level, so it unpacks into <dir>\.
+function New-FolderZip($Dir) {
+  $item = Get-Item -LiteralPath $Dir
+  if (-not $item.Parent) { Die "refusing to zip a drive root: $Dir" $EX_USAGE }
+  $files = @(Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Force |
+    Where-Object { $_.Name -notin '.DS_Store', 'Thumbs.db', 'desktop.ini' })
+  if ($files.Count -eq 0) { Die "${Dir}: folder is empty" 65 }
+  Say "Zipping $($item.Name)\"
+  $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("docshare-zip-" + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $tmp | Out-Null
+  $out = Join-Path $tmp "$($item.Name).zip"
+  # ZipArchive writes '/' separators on .NET Framework 4.6.1+ and .NET Core;
+  # Compress-Archive on PS 5.1 writes '\', which breaks unzip elsewhere.
+  Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+  $zip = [System.IO.Compression.ZipFile]::Open($out, [System.IO.Compression.ZipArchiveMode]::Create)
+  try {
+    $root = $item.Parent.FullName.TrimEnd('\', '/').Length + 1
+    foreach ($f in $files) {
+      $entry = $f.FullName.Substring($root).Replace('\', '/')
+      [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, $entry) | Out-Null
+    }
+  } finally { $zip.Dispose() }
+  return $out
+}
+
 function Invoke-Upload($Files) {
   if (-not $Files -or $Files.Count -eq 0) { Die 'usage: upload.ps1 [-Raw] [-Json] [-MakeRoom] <file|->...' $EX_USAGE }
   foreach ($f in $Files) {
-    if ($f -ne '-' -and -not (Test-Path -LiteralPath $f -PathType Leaf)) { Die "no such file: $f" $EX_NOINPUT }
+    if ($f -ne '-' -and -not (Test-Path -LiteralPath $f)) { Die "no such file: $f" $EX_NOINPUT }
   }
   foreach ($f in $Files) {
     if ($f -eq '-') {
@@ -236,6 +263,10 @@ function Invoke-Upload($Files) {
         $stdin.CopyTo($out); $out.Close()
         Send-File $tmp $Name
       } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+    } elseif (Test-Path -LiteralPath $f -PathType Container) {
+      $zip = New-FolderZip $f
+      try { Send-File $zip (Split-Path -Leaf $zip) }
+      finally { Remove-Item -LiteralPath (Split-Path -Parent $zip) -Recurse -Force -ErrorAction SilentlyContinue }
     } else {
       $item = Get-Item -LiteralPath $f
       Send-File $item.FullName $item.Name

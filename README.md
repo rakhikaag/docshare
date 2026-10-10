@@ -10,6 +10,8 @@ short URL → auto-deletes in 24h. Built for handing files to coding agents.
 - **Any other file** (≤ 400 MB) is uploaded **straight to R2 via a presigned PUT
   URL** (the bytes never pass through the Worker) and served back as a forced
   download, so an LLM/agent can `curl` it.
+- **Folders** (dropped, or picked with "pick a folder") are zipped in the browser
+  and upload as one `<folder>.zip`. The CLI does the same for `docshare <dir>`.
 
 Deployed at **docs.safzan.dev** — independent of seeshare (`share.safzan.dev`):
 separate Worker, separate R2 bucket, separate bindings.

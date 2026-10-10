@@ -98,6 +98,7 @@
     border-radius: 3px; font-size: 11px; color: var(--text); background: #221d33; margin: 0 2px;
   }
   .drop-sub { color: var(--text-dim); font-size: 12px; margin-top: 14px; font-family: var(--mono); }
+  .drop-hint { color: var(--text-dim); font-size: 12px; margin-top: 8px; }
   /* Image output format toggle. Lives inside the drop zone, which is itself a
      click-to-browse target — the handlers stopPropagation so picking a format
      doesn't also open the file dialog. */
@@ -300,6 +301,7 @@
     <div class="drop-title">
       <span class="kbd">⌘V</span> / <span class="kbd">Ctrl+V</span> to paste · drag &amp; drop · or click to browse
     </div>
+    <div class="drop-hint">folders upload as .zip · <a href="#" id="pick-folder">pick a folder</a></div>
     <div class="drop-sub" id="drop-sub">images → WebP · any file ≤ 400 MB (1.46 GB unlocked) · 24h TTL · sent straight to storage</div>
     <div class="format-seg" id="format-seg" role="group" aria-label="Image output format">
       <span class="format-label">images →</span>
@@ -310,6 +312,7 @@
     <div id="drop-status" class="drop-status"></div>
   </div>
   <input id="file-input" type="file" multiple hidden />
+  <input id="folder-input" type="file" webkitdirectory hidden />
 
   <div id="usage" class="usage" hidden>
     <div class="usage-row">
@@ -1257,8 +1260,165 @@
     setStatus('')
   }
 
+  // ----- folders → zip -----
+  // A dropped or picked folder uploads as one <folder>.zip, built here in the
+  // browser. Each file is deflated when that makes it smaller and stored as-is
+  // otherwise. Sizes stay under the per-file cap (< 4 GB), so no ZIP64.
+  const ZIP_JUNK = /^(\.DS_Store|Thumbs\.db|desktop\.ini)$/i
+  // Already-compressed formats: deflating them burns time for no gain.
+  const ZIP_STORE = /\.(zip|gz|tgz|bz2|xz|zst|7z|rar|jpe?g|png|gif|webp|avif|heic|mp4|m4v|mov|mkv|webm|mp3|m4a|aac|ogg|opus|flac|pdf|apk|docx|xlsx|pptx|woff2?)$/i
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256)
+    for (let n = 0; n < 256; n++) {
+      let c = n
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1
+      t[n] = c >>> 0
+    }
+    return t
+  })()
+
+  // Read one file once: CRC it and, when worthwhile, deflate it on the way.
+  async function zipData(file, onBytes) {
+    let crc = 0xFFFFFFFF
+    const tapped = file.stream().pipeThrough(new TransformStream({
+      transform(chunk, ctl) {
+        for (let i = 0; i < chunk.length; i++) crc = CRC_TABLE[(crc ^ chunk[i]) & 0xFF] ^ (crc >>> 8)
+        onBytes(chunk.length)
+        ctl.enqueue(chunk)
+      },
+    }))
+    let data = file, method = 0
+    if (typeof CompressionStream === 'function' && file.size > 0 && !ZIP_STORE.test(file.name)) {
+      const deflated = await new Response(tapped.pipeThrough(new CompressionStream('deflate-raw'))).blob()
+      if (deflated.size < file.size) { data = deflated; method = 8 }
+    } else {
+      await tapped.pipeTo(new WritableStream())
+    }
+    return { crc: (crc ^ 0xFFFFFFFF) >>> 0, data, method }
+  }
+
+  function dosDateTime(ms) {
+    const d = new Date(ms || Date.now())
+    const year = Math.max(1980, d.getFullYear())
+    return {
+      time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
+      date: ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+    }
+  }
+
+  // folder: { name, files: [{ path, file }], dirs: ['empty/dir/'] }, paths
+  // relative to the folder's parent so the zip unpacks into <name>/.
+  async function zipFolder(folder, onProgress) {
+    const total = folder.files.reduce((n, f) => n + f.file.size, 0)
+    const docMax = docLimit()
+    if (total > docMax) throw new Error(`folder too large (${fmtSize(total)}, ${fmtSize(docMax)} max)`)
+    if (folder.files.length + folder.dirs.length > 65535) throw new Error('folder has too many files (65535 max)')
+    if (!folder.files.length) throw new Error('folder is empty')
+    const enc = new TextEncoder()
+    const parts = [], central = []
+    let offset = 0, done = 0
+    const entries = [
+      ...folder.dirs.map((path) => ({ path, file: null })),
+      ...folder.files,
+    ]
+    for (const { path, file } of entries) {
+      const name = enc.encode(path)
+      const { crc, data, method } = file
+        ? await zipData(file, (n) => { done += n; onProgress(total ? done / total : 1) })
+        : { crc: 0, data: new Blob([]), method: 0 }
+      const { time, date } = dosDateTime(file && file.lastModified)
+      const size = file ? file.size : 0
+      const local = new DataView(new ArrayBuffer(30))
+      local.setUint32(0, 0x04034b50, true)
+      local.setUint16(4, 20, true)
+      local.setUint16(6, 0x0800, true) // UTF-8 names
+      local.setUint16(8, method, true)
+      local.setUint16(10, time, true)
+      local.setUint16(12, date, true)
+      local.setUint32(14, crc, true)
+      local.setUint32(18, data.size, true)
+      local.setUint32(22, size, true)
+      local.setUint16(26, name.length, true)
+      parts.push(local, name, data)
+      const cd = new DataView(new ArrayBuffer(46))
+      cd.setUint32(0, 0x02014b50, true)
+      cd.setUint16(4, 20, true)
+      cd.setUint16(6, 20, true)
+      cd.setUint16(8, 0x0800, true)
+      cd.setUint16(10, method, true)
+      cd.setUint16(12, time, true)
+      cd.setUint16(14, date, true)
+      cd.setUint32(16, crc, true)
+      cd.setUint32(20, data.size, true)
+      cd.setUint32(24, size, true)
+      cd.setUint16(28, name.length, true)
+      cd.setUint32(38, file ? 0 : 0x10, true) // MS-DOS directory attribute
+      cd.setUint32(42, offset, true)
+      central.push(cd, name)
+      offset += 30 + name.length + data.size
+    }
+    const cdSize = central.reduce((n, p) => n + p.byteLength, 0)
+    const end = new DataView(new ArrayBuffer(22))
+    end.setUint32(0, 0x06054b50, true)
+    end.setUint16(8, entries.length, true)
+    end.setUint16(10, entries.length, true)
+    end.setUint32(12, cdSize, true)
+    end.setUint32(16, offset, true)
+    return new File([...parts, ...central, end], `${folder.name}.zip`, { type: 'application/zip' })
+  }
+
+  // Walk a dropped directory entry into zipFolder's shape.
+  async function readDirEntry(root) {
+    const folder = { name: root.name, files: [], dirs: [] }
+    const walk = async (entry, path) => {
+      if (entry.isFile) {
+        if (ZIP_JUNK.test(entry.name)) return
+        folder.files.push({ path, file: await new Promise((res, rej) => entry.file(res, rej)) })
+        return
+      }
+      // readEntries hands back at most ~100 entries per call.
+      const reader = entry.createReader()
+      const kids = []
+      for (;;) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej))
+        if (!batch.length) break
+        kids.push(...batch)
+      }
+      if (!kids.length) folder.dirs.push(path + '/')
+      for (const k of kids) await walk(k, `${path}/${k.name}`)
+    }
+    await walk(root, root.name)
+    return folder
+  }
+
+  // Files from <input webkitdirectory> carry webkitRelativePath = "<folder>/…".
+  function folderFromPicked(files) {
+    const list = Array.from(files).filter((f) => !ZIP_JUNK.test(f.name))
+    const name = (files[0].webkitRelativePath || '').split('/')[0] || 'folder'
+    return { name, files: list.map((f) => ({ path: f.webkitRelativePath || `${name}/${f.name}`, file: f })), dirs: [] }
+  }
+
+  async function uploadFolder(folder, autocopy) {
+    progress.classList.add('show')
+    progressBar.style.width = '0%'
+    setStatus(`zipping ${folder.name}/ (${folder.files.length} file${folder.files.length === 1 ? '' : 's'})…`)
+    let zip
+    try {
+      zip = await zipFolder(folder, (frac) => {
+        const pct = Math.round(frac * 100)
+        progressBar.style.width = pct + '%'
+        setStatus(`zipping ${folder.name}/ ${pct}%…`)
+      })
+    } finally {
+      progress.classList.remove('show')
+    }
+    await uploadDoc(zip, autocopy)
+  }
+
   // ----- dispatch -----
   async function uploadOne(file, autocopy) {
+    if (file.folder) { await uploadFolder(await file.folder(), autocopy); return }
+    if (file.open) file = await file.open()
     if (file.type && file.type.startsWith('image/')) {
       try { await uploadImage(file, autocopy); return }
       catch (e) {
@@ -1270,7 +1430,9 @@
   }
 
   // Accepts one or many files (drop / pick / paste). Uploads sequentially so
-  // the per-IP rate limits and progress bar stay sane.
+  // the per-IP rate limits and progress bar stay sane. A folder arrives as
+  // { name, folder: () => Promise<folder> } and uploads as one zip; a file
+  // dropped next to it as { name, open: () => Promise<File> }.
   async function handleFiles(files) {
     const list = Array.from(files || []).filter(Boolean)
     if (!list.length) return
@@ -1327,10 +1489,34 @@
     if (fileInput.files?.length) handleFiles(fileInput.files)
     fileInput.value = ''
   })
+  const folderInput = $('folder-input')
+  $('pick-folder').addEventListener('click', (e) => {
+    // The drop zone is itself a click-to-browse target.
+    e.preventDefault()
+    e.stopPropagation()
+    folderInput.click()
+  })
+  folderInput.addEventListener('change', () => {
+    const files = Array.from(folderInput.files || [])
+    folderInput.value = ''
+    if (!files.length) return
+    const folder = folderFromPicked(files)
+    handleFiles([{ name: folder.name, folder: async () => folder }])
+  })
   ;['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('is-drag') }))
   ;['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('is-drag') }))
   drop.addEventListener('drop', (e) => {
-    if (e.dataTransfer?.files?.length) handleFiles(e.dataTransfer.files)
+    const dt = e.dataTransfer
+    if (!dt) return
+    // Grab entries during the event; the item list goes dead once it returns.
+    const entries = Array.from(dt.items || [], (it) => (it.kind === 'file' && it.webkitGetAsEntry) ? it.webkitGetAsEntry() : null)
+    if (entries.some((en) => en && en.isDirectory)) {
+      handleFiles(entries.filter(Boolean).map((en) => en.isDirectory
+        ? { name: en.name, folder: () => readDirEntry(en) }
+        : { name: en.name, open: () => new Promise((res, rej) => en.file(res, rej)) }))
+      return
+    }
+    if (dt.files?.length) handleFiles(dt.files)
   })
   window.addEventListener('paste', (e) => {
     const cd = e.clipboardData

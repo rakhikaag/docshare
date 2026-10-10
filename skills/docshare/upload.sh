@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # docshare — upload files to a docshare instance and manage your uploads.
 #
-#   upload.sh [options] <file|->...     upload; prints one URL per file
+#   upload.sh [options] <file|dir|->... upload; prints one URL per file
+#                                       (a directory uploads as <dir>.zip)
 #   upload.sh ls [--json]               list your uploads (newest first)
 #   upload.sh rm <url|id>... | --all    delete uploads
 #   upload.sh usage [--json]            daily quota and service storage
@@ -27,7 +28,8 @@ EX_UNAVAILABLE=69
 
 usage() {
   cat <<'EOF'
-usage: docshare [options] <file|->...        upload files, print one URL each
+usage: docshare [options] <file|dir|->...    upload files, print one URL each;
+                                             a directory uploads as <dir>.zip
        docshare ls [--json]                  list your uploads
        docshare rm <url|id>... | rm --all    delete uploads
        docshare usage [--json]               daily quota + service storage
@@ -127,7 +129,8 @@ owner_token() {
 
 HDRCFG=""
 TMPIN=""
-cleanup() { rm -f "$HDRCFG" "$TMPIN"; }
+TMPZIP=""
+cleanup() { rm -f "$HDRCFG" "$TMPIN"; [ -z "$TMPZIP" ] || rm -rf "$TMPZIP"; }
 trap cleanup EXIT
 
 header_config() {
@@ -277,6 +280,32 @@ upload_one() { # upload_one <path> <name>
   fi
 }
 
+# zip_dir <dir> — zip a directory into $TMPZIP and print the zip's path. The
+# archive keeps the folder as its top level, so it unpacks into <dir>/.
+# Callers run it in $(...), so the caller creates $TMPZIP for cleanup to see.
+zip_dir() {
+  local dir parent base out
+  dir=$(cd "$1" && pwd -P) || die "cannot read directory: $1" "$EX_NOINPUT"
+  [ "$dir" != / ] || die "refusing to zip the root directory" "$EX_USAGE"
+  parent=$(dirname "$dir")
+  base=$(basename "$dir")
+  [ -n "$(find "$dir" -type f ! -name .DS_Store -print -quit)" ] || die "$1: folder is empty" 65
+  out=$(mktemp -d "$TMPZIP/z.XXXXXX")/$base.zip
+  say "Zipping $base/"
+  # bsdtar first: macOS's zip leaves the UTF-8 flag off non-ASCII names, so
+  # Windows and Python unpack them garbled.
+  if command -v bsdtar >/dev/null; then
+    (cd "$parent" && bsdtar -a -cf "$out" --exclude .DS_Store --exclude Thumbs.db --exclude desktop.ini "$base") \
+      || die "$1: bsdtar failed" 1
+  elif command -v zip >/dev/null; then
+    (cd "$parent" && zip -qr -X "$out" "$base" -x '*/.DS_Store' '*/Thumbs.db' '*/desktop.ini') \
+      || die "$1: zip failed" 1
+  else
+    die "uploading a directory needs zip or bsdtar on PATH" "$EX_UNAVAILABLE"
+  fi
+  printf '%s' "$out"
+}
+
 cmd_upload() {
   local files=() name="" arg
   while [ $# -gt 0 ]; do
@@ -297,7 +326,7 @@ cmd_upload() {
   done
   [ ${#files[@]} -gt 0 ] || { usage >&2; exit "$EX_USAGE"; }
   for arg in "${files[@]}"; do
-    [ "$arg" = - ] || [ -f "$arg" ] || die "no such file: $arg" "$EX_NOINPUT"
+    [ "$arg" = - ] || [ -f "$arg" ] || [ -d "$arg" ] || die "no such file: $arg" "$EX_NOINPUT"
   done
   for arg in "${files[@]}"; do
     if [ "$arg" = - ]; then
@@ -305,6 +334,11 @@ cmd_upload() {
       TMPIN=$(mktemp "${TMPDIR:-/tmp}/docshare-stdin.XXXXXX")
       cat >"$TMPIN"
       upload_one "$TMPIN" "${name:-stdin.txt}"
+    elif [ -d "$arg" ]; then
+      local zip
+      [ -n "$TMPZIP" ] || TMPZIP=$(mktemp -d "${TMPDIR:-/tmp}/docshare-zip.XXXXXX")
+      zip=$(zip_dir "$arg")
+      upload_one "$zip" "$(basename "$zip")"
     else
       upload_one "$arg" "$(basename "$arg")"
     fi
