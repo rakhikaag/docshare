@@ -1,6 +1,6 @@
 // A fuller in-memory R2 bucket and Worker env, enough to drive src/index.ts's
 // routes through app.fetch without a Workers runtime.
-import { FakeKV } from './fakes'
+import { UploadLedger } from '../src/index'
 
 type Stored = {
   bytes: Uint8Array
@@ -76,12 +76,38 @@ export class MemoryR2 {
   }
 }
 
+// The namespace drives the real ledger queue and storage adapter. Only the
+// Cloudflare storage transport is substituted, not the admission logic.
+class MemoryDurableStorage {
+  store = new Map<string, unknown>()
+
+  async get<T>(key: string): Promise<T | undefined> {
+    return this.store.get(key) as T | undefined
+  }
+
+  async put(key: string, value: unknown): Promise<void> {
+    this.store.set(key, structuredClone(value))
+  }
+
+  async list<T>(opts: { prefix?: string; limit?: number; startAfter?: string } = {}): Promise<Map<string, T>> {
+    return new Map([...this.store].sort(([a], [b]) => a.localeCompare(b))
+      .filter(([key]) => (!opts.prefix || key.startsWith(opts.prefix)) && (!opts.startAfter || key > opts.startAfter))
+      .slice(0, opts.limit ?? 1000) as Array<[string, T]>)
+  }
+
+  async delete(keys: string[]): Promise<number> {
+    let deleted = 0
+    for (const key of keys) if (this.store.delete(key)) deleted++
+    return deleted
+  }
+}
+
 const allow = { limit: async () => ({ success: true }) }
 
 export function makeEnv(overrides: Record<string, string> = {}) {
   const env = {
     BUCKET: new MemoryR2(),
-    QUOTA: new FakeKV(),
+    LEDGER: {} as DurableObjectNamespace,
     UPLOAD_LIMITER: allow,
     DOC_LIMITER: allow,
     OCR_LIMITER: allow,
@@ -102,5 +128,21 @@ export function makeEnv(overrides: Record<string, string> = {}) {
     ADMIN_KEY: 'admin-secret',
     ...overrides,
   }
+  const storage = new MemoryDurableStorage()
+  let ready = Promise.resolve()
+  const state = {
+    storage,
+    blockConcurrencyWhile(fn: () => Promise<void>) { ready = fn(); return ready },
+  }
+  const ledger = new UploadLedger(state as unknown as DurableObjectState, env as never)
+  env.LEDGER = {
+    idFromName: () => 'uploads',
+    get: () => ({
+      async fetch(input: Request | string) {
+        await ready
+        return ledger.fetch(typeof input === 'string' ? new Request(input) : input)
+      },
+    }),
+  } as unknown as DurableObjectNamespace
   return env
 }

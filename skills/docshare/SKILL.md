@@ -140,6 +140,9 @@ curl -s -X DELETE -H "x-owner-token: $T" <share URL>  # delete
 curl -s -H "x-owner-token: $T" https://docs.safzan.dev/api/mine   # list
 ```
 
-Files over 100 MB use the three-step presigned flow
+Files over 100 MB use the required three-step flow
 (`/api/doc/presign` → PUT to R2 → `/api/doc/finalize`). The script always
-uses that flow. Errors are JSON `{"error": "<code>", "hint": "..."}`.
+uses that flow. Presigning does not consume daily quota; finalize publishes
+immutable bytes and charges their actual size. The direct PUT must send exactly
+the declared Content-Length (the scripts set it automatically for the file).
+Errors are JSON `{"error": "<code>", "hint": "..."}`.

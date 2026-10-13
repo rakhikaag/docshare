@@ -1,13 +1,7 @@
-// Global storage cap, backed by KV. R2's free tier is 10 GB of stored objects;
-// to make sure abuse can never push this Worker into paid billing, we track the
-// approximate total bytes currently stored and refuse new uploads once a hard
-// cap is reached.
-//
-// The counter is incremented on every upload and decremented on delete, but the
-// 24h R2 lifecycle rule deletes objects *without* notifying the Worker — so the
-// counter would only ever climb. A scheduled (cron) job periodically re-lists
-// the bucket, sums the real object sizes, and overwrites the counter. That
-// reconciliation is what makes the cap self-healing.
+// Global storage accounting. UploadLedger serializes checks, writes, deletes,
+// and reconciliation so concurrent uploads cannot lose counter updates.
+// Direct-to-R2 staging objects are not published until finalize accepts them.
+import type { CounterStore } from './ledger'
 
 const STORAGE_KEY = 'storage:used'
 
@@ -17,16 +11,14 @@ const STORAGE_KEY = 'storage:used'
 // than writing a truncated (too-low) sum.
 const MAX_RECONCILE_PAGES = 1000
 
-export async function getStorageUsed(kv: KVNamespace): Promise<number> {
+export async function getStorageUsed(kv: CounterStore): Promise<number> {
   const raw = await kv.get(STORAGE_KEY)
   const n = raw ? Number(raw) : 0
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
-// Best-effort, non-atomic adjustment (KV has no atomic increment). Concurrent
-// uploads can lose an update; the cron reconciliation corrects any drift. Never
-// let the stored value go negative.
-export async function addStorageUsed(kv: KVNamespace, delta: number): Promise<void> {
+// Called only from the ledger's serialized request queue.
+export async function addStorageUsed(kv: CounterStore, delta: number): Promise<void> {
   if (!Number.isFinite(delta) || delta === 0) return
   const cur = await getStorageUsed(kv)
   const next = Math.max(0, cur + delta)
@@ -35,7 +27,7 @@ export async function addStorageUsed(kv: KVNamespace, delta: number): Promise<vo
 
 // True when storing `addBytes` more would stay within the cap.
 export async function withinStorageCap(
-  kv: KVNamespace,
+  kv: CounterStore,
   addBytes: number,
   cap: number,
 ): Promise<boolean> {
@@ -45,13 +37,17 @@ export async function withinStorageCap(
 }
 
 // Re-sum the whole bucket and overwrite the counter. Called from the cron.
-export async function reconcileStorage(kv: KVNamespace, bucket: R2Bucket): Promise<void> {
+export async function reconcileStorage(kv: CounterStore, bucket: R2Bucket): Promise<void> {
   let total = 0
   let cursor: string | undefined
   let pages = 0
   do {
     const listed = await bucket.list({ cursor, limit: 1000 })
-    for (const obj of listed.objects) total += obj.size
+    for (const obj of listed.objects) {
+      if (obj.key.startsWith('doc/') || (obj.key.startsWith('img/') && (obj.key.endsWith('.webp') || obj.key.endsWith('.png')))) {
+        total += obj.size
+      }
+    }
     cursor = listed.truncated ? listed.cursor : undefined
     pages++
     if (pages >= MAX_RECONCILE_PAGES && cursor) {

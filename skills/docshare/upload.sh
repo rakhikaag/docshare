@@ -219,7 +219,7 @@ upload_one() { # upload_one <path> <name>
   [ "$size" -gt 0 ] || die "$name: file is empty" 65
   mime=$(mime_for "$path" "$name")
 
-  # 1) presign — reserves an id, charges the daily quota, returns a PUT URL.
+  # 1) presign — reserves an id without consuming daily quota.
   body="{\"filename\":$(json_str "$name"),\"size\":$size,\"contentType\":$(json_str "$mime")"
   [ "$MAKE_ROOM" = 1 ] && body="$body,\"makeRoom\":true"
   body="$body}"
@@ -245,7 +245,6 @@ upload_one() { # upload_one <path> <name>
   puturl=$(json_field "$BODY" putUrl)
   dlurl=$(json_field "$BODY" downloadUrl)
   [ -n "$id" ] && [ -n "$puturl" ] && [ -n "$dlurl" ] || die "$name: presign returned incomplete upload metadata" "$EX_SERVER"
-  local presigned=$BODY
 
   # 2) PUT the bytes straight to R2. curl streams the file. A stalled transfer
   # fails within 60 s; every attempt has a 15 min ceiling.
@@ -264,7 +263,7 @@ upload_one() { # upload_one <path> <name>
     sleep 2
   done
 
-  # 3) finalize — confirms the object landed and enforces the size cap.
+  # 3) finalize — publishes immutable bytes and charges actual-size quotas.
   say "Finalizing $name"
   api POST /api/doc/finalize "{\"id\":\"$id\"}"
   ok || fail_response "$name: finalize"
@@ -272,7 +271,7 @@ upload_one() { # upload_one <path> <name>
   if [ "$JSON" = 1 ]; then
     printf '{"id":"%s","url":%s,"rawUrl":%s,"filename":%s,"size":%s,"expiresAt":%s}\n' \
       "$id" "$(json_str "$dlurl")" "$(json_str "$dlurl?raw=1")" "$(json_str "$name")" "$size" \
-      "$(json_field "$presigned" expiresAt)"
+      "$(json_field "$BODY" expiresAt)"
   elif [ "$RAW" = 1 ]; then
     echo "$dlurl?raw=1"
   else

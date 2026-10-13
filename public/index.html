@@ -1085,8 +1085,8 @@
     let { width, height } = bitmap
     if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
       const scale = MAX_DIMENSION / Math.max(width, height)
-      width = Math.round(width * scale)
-      height = Math.round(height * scale)
+      width = Math.max(1, Math.round(width * scale))
+      height = Math.max(1, Math.round(height * scale))
     }
     const canvas = Object.assign(document.createElement('canvas'), { width, height })
     const ctx = canvas.getContext('2d')
@@ -1097,18 +1097,21 @@
     return toWebpBlob(canvas, ctx, width, height)
   }
 
-  // PNG is lossless — there is no quality knob to walk down, so this is
-  // single-shot. Oversized output is a hard failure with a pointer at WEBP
-  // rather than a retry loop that cannot converge.
-  // toBlob('image/png') is universally reliable, so none of the iOS WebP
-  // fallback machinery below applies here.
+  // PNG has no lossy quality control. Reduce dimensions only when necessary,
+  // always drawing from the original canvas rather than repeatedly resampling.
   async function toPngBlob(canvas, width, height) {
-    const blob = await new Promise((res) => canvas.toBlob((b) => res(b), 'image/png'))
-    if (!blob) throw new Error('could not encode PNG')
-    if (blob.size > MAX_IMAGE_BYTES) {
-      throw new Error(`PNG too large (${fmtSize(blob.size)}) — switch to WEBP`)
+    let output = canvas
+    while (true) {
+      const blob = await new Promise((res) => output.toBlob(res, 'image/png'))
+      if (!blob) throw new Error('could not encode PNG')
+      if (blob.size <= MAX_IMAGE_BYTES) return blob
+      if (width === 1 && height === 1) throw new Error('PNG too large at minimum dimensions')
+      const scale = Math.min(0.8, Math.sqrt(MAX_IMAGE_BYTES / blob.size) * 0.9)
+      width = Math.max(1, Math.floor(width * scale))
+      height = Math.max(1, Math.floor(height * scale))
+      output = Object.assign(document.createElement('canvas'), { width, height })
+      output.getContext('2d').drawImage(canvas, 0, 0, width, height)
     }
-    return blob
   }
 
   async function toWebpBlob(canvas, ctx, width, height) {
@@ -1255,7 +1258,7 @@
       throw new Error(err)
     }
 
-    pushRecent({ kind: 'doc', id: presign.id, url: presign.downloadUrl, filename: presign.filename, contentType: file.type || 'application/octet-stream', uploadedAt: presign.uploadedAt, expiresAt: presign.expiresAt, size: finalized.size || file.size })
+    pushRecent({ kind: 'doc', id: presign.id, url: presign.downloadUrl, filename: presign.filename, contentType: file.type || 'application/octet-stream', uploadedAt: finalized.uploadedAt, expiresAt: finalized.expiresAt, size: finalized.size || file.size })
     if (autocopy) copy(presign.downloadUrl, 'uploaded · URL copied')
     setStatus('')
   }

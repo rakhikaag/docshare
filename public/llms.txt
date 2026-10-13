@@ -85,10 +85,13 @@ matter:
   expiresAt, size}`.
 - [POST /api/doc/presign](https://docs.safzan.dev/api/doc/presign) — step 1 of
   3 for large docs. Body: `{filename, size, contentType, makeRoom?}`. Returns
-  `{id, putUrl, downloadUrl, rawUrl, uploadedAt, expiresAt, size}`. PUT the file bytes
-  directly to `putUrl` (a presigned R2 S3 URL), then POST to /api/doc/finalize.
-- [POST /api/doc/finalize](https://docs.safzan.dev/api/doc/finalize) — step 3.
-  Body: `{id}`. Confirms the upload landed and enforces max size.
+  `{id, putUrl, downloadUrl, rawUrl, uploadedAt, expiresAt, size}`. PUT the exact file
+  bytes directly to `putUrl`, with Content-Length equal to `size` (curl and browsers
+  set it for a file body). Presigning does not consume daily quota. Then finalize.
+- [POST /api/doc/finalize](https://docs.safzan.dev/api/doc/finalize) — required step 3.
+  Body: `{id}`. Publishes immutable bytes and charges their actual size against
+  exact daily and published-storage quotas. A share URL is unreadable until this
+  succeeds. Use the returned uploadedAt/expiresAt/size as the completed metadata.
 - [GET /d/:id/:filename](https://docs.safzan.dev/d/) — fetch a doc. Programmatic
   clients (curl/agents, no `text/html` in `Accept`) get the raw bytes as a forced
   download (`Content-Disposition: attachment` + `X-Content-Type-Options: nosniff`).

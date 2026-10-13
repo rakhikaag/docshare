@@ -8,6 +8,7 @@ import ogSvg from '../public/og.svg'
 import icon192 from '../public/icon-192.png'
 import icon512 from '../public/icon-512.png'
 import { readConfig } from './config'
+import { durableCounters, pruneCounters, type CounterStore } from './ledger'
 import {
   DEFAULT_DOC_CONTENT_TYPE,
   asciiFilename,
@@ -42,6 +43,8 @@ import { OWNER_TOKEN_HEADER, ownerTagFrom, ownsItem } from './owner'
 import { presignPutUrl } from './presign'
 import {
   checkAndChargeDaily,
+  chargeDailyTag,
+  checkDaily,
   dailyResetAt,
   hashIp,
   readDailyUsage,
@@ -82,7 +85,8 @@ type RateLimiter = {
 
 type Bindings = {
   BUCKET: R2Bucket
-  QUOTA: KVNamespace
+  QUOTA: CounterStore
+  LEDGER: DurableObjectNamespace
   UPLOAD_LIMITER: RateLimiter
   DOC_LIMITER: RateLimiter
   OCR_LIMITER: RateLimiter
@@ -127,6 +131,8 @@ type DocMeta = {
   finalized?: boolean
   uploaderTag?: string
   ownerTag?: string
+  dailyCharged?: boolean
+  maxBytes?: number
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -170,7 +176,7 @@ function quotaErrorBody(q: { reason: 'daily_count' | 'daily_bytes'; limit: numbe
   }
 }
 
-async function storageFullBody(kv: KVNamespace, cap: number) {
+async function storageFullBody(kv: CounterStore, cap: number) {
   return {
     error: 'storage_full' as const,
     used: await getStorageUsed(kv),
@@ -314,27 +320,23 @@ app.put('/upload/:filename', async (c) => {
     return c.text(errorText(await storageFullBody(c.env.QUOTA, cfg.maxTotalBytes)), 507)
   }
 
-  if (charged) {
-    const quota = await checkAndChargeDaily(c.env.QUOTA, ip, declared, cfg.dailyCount, cfg.dailyBytes)
-    if (!quota.ok) return c.text(errorText(quotaErrorBody(quota)), 429)
-  }
-  const refund = async () => { if (charged) await refundChargedDaily(c.env.QUOTA, ip, declared) }
-
   let id = ''
   let storageCharged = 0
   const buf = await c.req.arrayBuffer()
   if (buf.byteLength === 0) {
-    await refund()
     return c.text('empty\n', 400)
   }
-  if (buf.byteLength > SIMPLE_UPLOAD_MAX) {
-    await refund()
+  if (buf.byteLength > Math.min(SIMPLE_UPLOAD_MAX, isAdmin(c) ? cfg.maxAdminDocBytes : cfg.maxDocBytes)) {
     return c.text('too_large\n', 413)
   }
   if (!(await withinStorageCap(c.env.QUOTA, buf.byteLength, cfg.maxTotalBytes))) {
-    await refund()
     return c.text(errorText(await storageFullBody(c.env.QUOTA, cfg.maxTotalBytes)), 507)
   }
+  if (charged) {
+    const quota = await checkAndChargeDaily(c.env.QUOTA, ip, buf.byteLength, cfg.dailyCount, cfg.dailyBytes)
+    if (!quota.ok) return c.text(errorText(quotaErrorBody(quota)), 429)
+  }
+  const refund = async () => { if (charged) await refundChargedDaily(c.env.QUOTA, ip, buf.byteLength) }
 
   id = generateId(16)
   if (await c.env.BUCKET.head(`doc/${id}`)) id = generateId(16)
@@ -350,7 +352,7 @@ app.put('/upload/:filename', async (c) => {
       filename,
       contentType,
       size: buf.byteLength,
-      chargedSize: declared,
+      chargedSize: charged ? buf.byteLength : 0,
       uploadedAt,
       expiresAt,
       finalized: true,
@@ -531,8 +533,8 @@ app.post('/api/ocr/:id', async (c) => {
 // download so an LLM/agent can fetch the raw file.
 // ----------------------------------------------------------------------------
 
-// Step 1: reserve an id, charge the per-IP daily quota, write a metadata
-// sidecar, and hand back a short-lived presigned PUT URL.
+// Step 1: reserve an id without charging daily quota. Content-Length is signed
+// so the direct R2 PUT must contain exactly the declared number of bytes.
 app.post('/api/doc/presign', async (c) => {
   const ip = clientIp(c.req.raw)
   const { success } = await c.env.DOC_LIMITER.limit({ key: ip })
@@ -579,7 +581,7 @@ app.post('/api/doc/presign', async (c) => {
 
   let putUrl: string
   try {
-    putUrl = await presignPutUrl(c.env, `doc/${id}`)
+    putUrl = await presignPutUrl(c.env, `pending/${id}`, size)
   } catch (e) {
     // Never surface the signer's message — it can name the account and bucket.
     console.error('presign_failed', (e as Error).message)
@@ -588,7 +590,7 @@ app.post('/api/doc/presign', async (c) => {
 
   const uploaderTag = await hashIp(ip)
   if (charged) {
-    const quota = await checkAndChargeDaily(c.env.QUOTA, ip, size, cfg.dailyCount, cfg.dailyBytes)
+    const quota = await checkDaily(c.env.QUOTA, uploaderTag, size, cfg.dailyCount, cfg.dailyBytes)
     if (!quota.ok) return c.json(quotaErrorBody(quota), 429)
   }
 
@@ -596,21 +598,18 @@ app.post('/api/doc/presign', async (c) => {
     filename,
     contentType,
     size,
-    chargedSize: size,
+    chargedSize: 0,
     uploadedAt,
     expiresAt,
     finalized: false,
     uploaderTag,
     ownerTag,
+    dailyCharged: charged,
+    maxBytes: maxDoc,
   }
-  try {
-    await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
-      httpMetadata: { contentType: 'application/json' },
-    })
-  } catch (e) {
-    if (charged) await refundChargedDaily(c.env.QUOTA, ip, size)
-    throw e
-  }
+  await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
+    httpMetadata: { contentType: 'application/json' },
+  })
 
   const downloadUrl = docUrl(c.env.PUBLIC_ORIGIN, id, filename)
   return c.json({
@@ -619,9 +618,8 @@ app.post('/api/doc/presign', async (c) => {
   })
 })
 
-// Step 2 (optional but recommended): confirm the upload landed and enforce the
-// real size. A presigned PUT can't enforce a max size, so we verify here and
-// delete anything that came in over the limit.
+// Step 3 is required: publish an immutable snapshot and charge its actual size.
+// The still-valid PUT URL can only overwrite pending/, never the shared object.
 app.post('/api/doc/finalize', async (c) => {
   const ip = clientIp(c.req.raw)
   const cfg = readConfig(c.env)
@@ -634,59 +632,60 @@ app.post('/api/doc/finalize', async (c) => {
   const id = String(body.id ?? '')
   if (!isValidId(id)) return c.json({ error: 'bad_id' }, 400)
 
-  const obj = await c.env.BUCKET.head(`doc/${id}`)
-  if (!obj) return c.json({ error: 'not_found' }, 404)
-
   const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
   const meta = metaObj ? await metaObj.json<DocMeta>() : undefined
-  if (!meta) {
-    await c.env.BUCKET.delete(`doc/${id}`)
-    return c.json({ error: 'not_found' }, 404)
+  if (!meta || !meta.uploaderTag) return c.json({ error: 'not_found' }, 404)
+  if (meta.finalized) {
+    if (!(await c.env.BUCKET.head(`doc/${id}`))) return c.json({ error: 'not_found' }, 404)
+    return c.json({ id, size: meta.size, uploadedAt: meta.uploadedAt, expiresAt: meta.expiresAt, finalized: true })
   }
-  const alreadyFinalized = meta?.finalized === true
-  const previousFinalizedSize = alreadyFinalized ? nonNegative(meta?.size) : 0
-  const chargedSize = chargedDocSize(meta, obj.size)
-  const uploadedAt = Number(meta?.uploadedAt ?? 0)
-  const uploaderTag = typeof meta?.uploaderTag === 'string' ? meta.uploaderTag : undefined
+  if (nonNegative(meta.expiresAt) <= Date.now()) return c.json({ error: 'expired' }, 410)
 
-  const maxDoc = isAdmin(c) ? cfg.maxAdminDocBytes : cfg.maxDocBytes
-  if (obj.size > maxDoc) {
-    await c.env.BUCKET.delete(`doc/${id}`)
-    await c.env.BUCKET.delete(`meta/${id}.json`)
-    if (previousFinalizedSize > 0) await addStorageUsed(c.env.QUOTA, -previousFinalizedSize)
-    await refundDaily(c.env.QUOTA, ip, chargedSize, uploadedAt, uploaderTag)
-    return c.json({ error: 'too_large', max: maxDoc }, 413)
+  // get() binds the size and body to one R2 object version, avoiding a race
+  // between head() validation and a concurrent overwrite of the upload URL.
+  const obj = await c.env.BUCKET.get(`pending/${id}`)
+  if (!obj) return c.json({ error: 'not_found' }, 404)
+  const maxDoc = nonNegative(meta.maxBytes) || cfg.maxDocBytes
+  if (obj.size === 0 || obj.size > maxDoc) {
+    await c.env.BUCKET.delete(`pending/${id}`)
+    return c.json({ error: obj.size === 0 ? 'empty' : 'too_large', max: maxDoc }, 413)
   }
-
-  const storageDelta = obj.size - previousFinalizedSize
-  if (storageDelta > 0 && !(await withinStorageCap(c.env.QUOTA, storageDelta, cfg.maxTotalBytes))) {
-    await c.env.BUCKET.delete(`doc/${id}`)
-    await c.env.BUCKET.delete(`meta/${id}.json`)
-    if (previousFinalizedSize > 0) await addStorageUsed(c.env.QUOTA, -previousFinalizedSize)
-    await refundDaily(c.env.QUOTA, ip, chargedSize, uploadedAt, uploaderTag)
+  if (!(await withinStorageCap(c.env.QUOTA, obj.size, cfg.maxTotalBytes))) {
+    await c.env.BUCKET.delete(`pending/${id}`)
     return c.json(await storageFullBody(c.env.QUOTA, cfg.maxTotalBytes), 507)
   }
-
-  let storageAdjusted = 0
-  try {
-    if (storageDelta !== 0) {
-      await addStorageUsed(c.env.QUOTA, storageDelta)
-      storageAdjusted = storageDelta
+  const uploadedAt = Date.now()
+  const charged = meta.dailyCharged !== false
+  if (charged) {
+    const quota = await chargeDailyTag(c.env.QUOTA, meta.uploaderTag, obj.size, cfg.dailyCount, cfg.dailyBytes)
+    if (!quota.ok) {
+      await c.env.BUCKET.delete(`pending/${id}`)
+      return c.json(quotaErrorBody(quota), 429)
     }
-    meta.size = obj.size
-    meta.chargedSize = chargedSize
-    meta.finalized = true
-    await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
-      httpMetadata: { contentType: 'application/json' },
+  }
+  let storageAdjusted = false
+  try {
+    await c.env.BUCKET.put(`doc/${id}`, obj.body, {
+      httpMetadata: { contentType: meta.contentType || DEFAULT_DOC_CONTENT_TYPE },
     })
+    await addStorageUsed(c.env.QUOTA, obj.size)
+    storageAdjusted = true
+    await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify({
+      ...meta,
+      size: obj.size,
+      chargedSize: charged ? obj.size : 0,
+      uploadedAt,
+      expiresAt: uploadedAt + cfg.ttlMs,
+      finalized: true,
+    }), { httpMetadata: { contentType: 'application/json' } })
   } catch (e) {
-    if (storageAdjusted !== 0) await addStorageUsed(c.env.QUOTA, -storageAdjusted)
+    if (charged) await refundDaily(c.env.QUOTA, ip, obj.size, uploadedAt, meta.uploaderTag, true)
+    if (storageAdjusted) await addStorageUsed(c.env.QUOTA, -obj.size)
+    await c.env.BUCKET.delete(`doc/${id}`)
     throw e
   }
-  // Charge the global storage counter with the real object size. Re-finalize is
-  // idempotent unless the still-valid presigned PUT overwrote the same key; then
-  // adjust by the size delta.
-  return c.json({ id, size: obj.size, finalized: true })
+  await c.env.BUCKET.delete(`pending/${id}`)
+  return c.json({ id, size: obj.size, uploadedAt, expiresAt: uploadedAt + cfg.ttlMs, finalized: true })
 })
 
 // Download / inline-serve. The :filename segment is cosmetic (so curl/agents
@@ -875,9 +874,7 @@ app.get('/api/usage', async (c) => {
 const MINE_SCAN_CAP = 5000 // safety bound on objects scanned per prefix
 const MINE_FETCH_CONCURRENCY = 50
 
-// An un-finalized doc (presigned, never confirmed) still holds a daily-quota
-// charge. Past this age its presigned URL is long dead, so make-room may treat
-// it as abandoned and reclaim the charge without racing a live upload.
+// Abandoned presign sidecars may be cleaned up, but they never hold daily quota.
 const ABANDONED_PRESIGN_MS = 30 * 60 * 1000
 
 type OwnedItem = RoomCandidate & {
@@ -951,7 +948,7 @@ async function listOwned(
         uploadedAt,
         expiresAt: nonNegative(meta.expiresAt),
         url: docUrl(env.PUBLIC_ORIGIN, id, filename),
-        refundsDaily: refundsCallerToday(callerIpTag, uploadedAt, meta.uploaderTag),
+        refundsDaily: finalized && chargedDocSize(meta, 0) > 0 && refundsCallerToday(callerIpTag, uploadedAt, meta.uploaderTag),
       })
     }
   }
@@ -1169,6 +1166,7 @@ async function deleteUpload(
   const finalized = meta?.finalized === true
   const finalizedSize = finalized ? nonNegative(meta?.size) : 0
   if (doc) await env.BUCKET.delete(`doc/${id}`)
+  await env.BUCKET.delete(`pending/${id}`)
   await env.BUCKET.delete(`meta/${id}.json`)
   // Only un-charge bytes the counter was actually charged (docs are charged
   // at /finalize). An un-finalized orphan never hit the counter.
@@ -1221,14 +1219,49 @@ app.delete('/i/:filename{[A-Za-z0-9]+\\.(webp|png)}', (c) => {
 
 // ----------------------------------------------------------------------------
 function chargedDocSize(meta: DocMeta | undefined, fallback: number): number {
-  return nonNegative(meta?.chargedSize) || nonNegative(meta?.size) || nonNegative(fallback)
+  return meta?.chargedSize !== undefined ? nonNegative(meta.chargedSize) : nonNegative(meta?.size) || nonNegative(fallback)
+}
+
+// A single ledger owns admission and accounting for this personal-scale service.
+// Serializing entire handlers (not just each storage access) closes check/write
+// races across finalize, uploads, deletes, make-room, and cron reconciliation.
+export class UploadLedger {
+  private tail: Promise<unknown> = Promise.resolve()
+  private readonly counters: CounterStore
+
+  constructor(private readonly state: DurableObjectState, private readonly env: Bindings) {
+    this.counters = durableCounters(state.storage)
+    state.blockConcurrencyWhile(async () => {
+      if (await state.storage.get('initialized')) return
+      await reconcileStorage(this.counters, env.BUCKET)
+      await state.storage.put('initialized', true)
+    })
+  }
+
+  fetch(req: Request): Promise<Response> {
+    const result = this.tail.then(async () => {
+      if (new URL(req.url).pathname === '/internal/reconcile') {
+        await reconcileStorage(this.counters, this.env.BUCKET)
+        await pruneCounters(this.state.storage)
+        return new Response(null, { status: 204 })
+      }
+      return app.fetch(req, { ...this.env, QUOTA: this.counters }, this.state as unknown as ExecutionContext)
+    })
+    this.tail = result.catch(() => undefined)
+    return result
+  }
 }
 
 export default {
-  fetch: (req: Request, env: Bindings, ctx: ExecutionContext) => app.fetch(req, env, ctx),
-  // Cron (see wrangler.toml [triggers]): re-sum the bucket so storage that the
-  // 24h lifecycle rule deleted gets subtracted from the counter.
+  fetch: (req: Request, env: Bindings, ctx: ExecutionContext) => {
+    const path = new URL(req.url).pathname
+    if (path === '/internal/reconcile') return new Response(null, { status: 404 })
+    if ((req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') || path === '/api/usage' || path === '/api/mine') {
+      return env.LEDGER.get(env.LEDGER.idFromName('uploads')).fetch(req)
+    }
+    return app.fetch(req, env, ctx)
+  },
   scheduled: (_event: ScheduledController, env: Bindings, ctx: ExecutionContext) => {
-    ctx.waitUntil(reconcileStorage(env.QUOTA, env.BUCKET))
+    ctx.waitUntil(env.LEDGER.get(env.LEDGER.idFromName('uploads')).fetch('https://ledger/internal/reconcile'))
   },
 }

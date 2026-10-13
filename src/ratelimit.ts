@@ -1,10 +1,5 @@
-// Per-IP daily caps on doc uploads, backed by KV. The Cloudflare rate-limit
-// binding only supports 10s/60s windows (good for burst control), so the
-// longer "N per day / M bytes per day" abuse caps live here.
-//
-// KV is eventually consistent, so these caps are approximate under a burst of
-// concurrent uploads from one IP. That's fine: they exist to bound abuse, not
-// to bill anyone to the byte. The 60s burst binding stops the concurrent case.
+// Per-IP daily document caps. All calls run in UploadLedger's serialized queue.
+import type { CounterStore } from './ledger'
 
 type DailyQuota = { count: number; bytes: number }
 
@@ -40,14 +35,14 @@ async function quotaKeyForIp(ip: string): Promise<string> {
 // cross-day and non-owner refunds stops quota farming by deleting old or other
 // people's files. Best-effort.
 export async function refundDaily(
-  kv: KVNamespace,
+  kv: CounterStore,
   ip: string,
   size: number,
   uploadedAt: number,
   uploaderTag: string | undefined,
   callerOwns = false,
 ): Promise<void> {
-  if (!Number.isFinite(uploadedAt) || uploadedAt <= 0) return
+  if (size <= 0 || !Number.isFinite(uploadedAt) || uploadedAt <= 0) return
   if (utcDay(new Date(uploadedAt)) !== utcDay()) return // only today's counter is live
   if (!uploaderTag) return
   if (!callerOwns && (await hashIp(ip)) !== uploaderTag) return // only the original uploader
@@ -74,14 +69,14 @@ export function dailyResetAt(now = new Date()): string {
 
 // Undo a quota charge from the same request/IP after a later upload step fails.
 export async function refundChargedDaily(
-  kv: KVNamespace,
+  kv: CounterStore,
   ip: string,
   size: number,
 ): Promise<void> {
   await refundKey(kv, await quotaKeyForIp(ip), size)
 }
 
-async function refundKey(kv: KVNamespace, key: string, size: number): Promise<void> {
+async function refundKey(kv: CounterStore, key: string, size: number): Promise<void> {
   const cur = await readKey(kv, key)
   const next: DailyQuota = {
     count: Math.max(0, cur.count - 1),
@@ -90,11 +85,11 @@ async function refundKey(kv: KVNamespace, key: string, size: number): Promise<vo
   await kv.put(key, JSON.stringify(next), { expirationTtl: DAY_TTL_SECONDS })
 }
 
-async function readQuota(kv: KVNamespace, ip: string): Promise<DailyQuota> {
+async function readQuota(kv: CounterStore, ip: string): Promise<DailyQuota> {
   return readKey(kv, await quotaKeyForIp(ip))
 }
 
-async function readKey(kv: KVNamespace, key: string): Promise<DailyQuota> {
+async function readKey(kv: CounterStore, key: string): Promise<DailyQuota> {
   const raw = await kv.get(key)
   if (!raw) return { count: 0, bytes: 0 }
   try {
@@ -114,7 +109,7 @@ function nonNegativeNumber(value: unknown): number {
 }
 
 // Read the requester's current daily usage without charging it (for /api/usage).
-export async function readDailyUsage(kv: KVNamespace, ip: string): Promise<DailyQuota> {
+export async function readDailyUsage(kv: CounterStore, ip: string): Promise<DailyQuota> {
   return readQuota(kv, ip)
 }
 
@@ -122,24 +117,46 @@ export type QuotaCheck =
   | { ok: true }
   | { ok: false; reason: 'daily_count' | 'daily_bytes'; limit: number; used: number }
 
+export async function checkDaily(
+  kv: CounterStore,
+  uploaderTag: string,
+  addBytes: number,
+  maxCount: number,
+  maxBytes: number,
+): Promise<QuotaCheck> {
+  const cur = await readKey(kv, quotaKey(uploaderTag))
+  if (cur.count >= maxCount) {
+    return { ok: false, reason: 'daily_count', limit: maxCount, used: cur.count }
+  }
+  if (cur.bytes + nonNegativeNumber(addBytes) > maxBytes) {
+    return { ok: false, reason: 'daily_bytes', limit: maxBytes, used: cur.bytes }
+  }
+  return { ok: true }
+}
+
+export async function chargeDailyTag(
+  kv: CounterStore,
+  uploaderTag: string,
+  addBytes: number,
+  maxCount: number,
+  maxBytes: number,
+): Promise<QuotaCheck> {
+  const checked = await checkDaily(kv, uploaderTag, addBytes, maxCount, maxBytes)
+  if (!checked.ok) return checked
+  const key = quotaKey(uploaderTag)
+  const cur = await readKey(kv, key)
+  await kv.put(key, JSON.stringify({ count: cur.count + 1, bytes: cur.bytes + nonNegativeNumber(addBytes) }), {
+    expirationTtl: DAY_TTL_SECONDS,
+  })
+  return { ok: true }
+}
+
 export async function checkAndChargeDaily(
-  kv: KVNamespace,
+  kv: CounterStore,
   ip: string,
   addBytes: number,
   maxCount: number,
   maxBytes: number,
 ): Promise<QuotaCheck> {
-  const bytesToAdd = nonNegativeNumber(addBytes)
-  const cur = await readQuota(kv, ip)
-  if (cur.count >= maxCount) {
-    return { ok: false, reason: 'daily_count', limit: maxCount, used: cur.count }
-  }
-  if (cur.bytes + bytesToAdd > maxBytes) {
-    return { ok: false, reason: 'daily_bytes', limit: maxBytes, used: cur.bytes }
-  }
-  const next: DailyQuota = { count: cur.count + 1, bytes: cur.bytes + bytesToAdd }
-  await kv.put(await quotaKeyForIp(ip), JSON.stringify(next), {
-    expirationTtl: DAY_TTL_SECONDS,
-  })
-  return { ok: true }
+  return chargeDailyTag(kv, await hashIp(ip), addBytes, maxCount, maxBytes)
 }

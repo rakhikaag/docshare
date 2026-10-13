@@ -16,6 +16,7 @@ type PresignEnv = {
 export async function presignPutUrl(
   env: PresignEnv,
   key: string,
+  size: number,
   expiresSeconds = 300,
 ): Promise<string> {
   const client = new AwsClient({
@@ -31,7 +32,8 @@ export async function presignPutUrl(
 
   const signed = await client.sign(url.toString(), {
     method: 'PUT',
-    aws: { signQuery: true },
+    headers: { 'content-length': String(size) },
+    aws: { signQuery: true, allHeaders: true },
   })
   return signed.url
 }

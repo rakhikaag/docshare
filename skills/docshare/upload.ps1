@@ -170,7 +170,7 @@ function Send-File($Path, $FileName) {
   if ($size -eq 0) { Die "${FileName}: file is empty" 65 }
   $mime = Get-Mime $Path $FileName
 
-  # 1) presign — reserves an id, charges the daily quota, returns a PUT URL.
+  # 1) presign — reserves an id without consuming daily quota.
   $body = @{ filename = $FileName; size = $size; contentType = $mime }
   if ($MakeRoom) { $body.makeRoom = $true }
   $waited = 0
@@ -207,14 +207,14 @@ function Send-File($Path, $FileName) {
     }
   }
 
-  # 3) finalize — confirms the object landed and enforces the size cap.
+  # 3) finalize — publishes immutable bytes and charges actual-size quotas.
   Say "Finalizing $FileName"
   $r = Invoke-Api 'Post' '/api/doc/finalize' @{ id = $presign.id }
   if (-not (Test-Ok $r)) { Fail "${FileName}: finalize" $r }
 
   $url = $presign.downloadUrl
   if ($Json) {
-    [pscustomobject]@{ id = $presign.id; url = $url; rawUrl = "$url`?raw=1"; filename = $FileName; size = $size; expiresAt = $presign.expiresAt } |
+    [pscustomobject]@{ id = $presign.id; url = $url; rawUrl = "$url`?raw=1"; filename = $FileName; size = $r.Body.size; expiresAt = $r.Body.expiresAt } |
       ConvertTo-Json -Compress
   } elseif ($Raw) {
     "$url`?raw=1"

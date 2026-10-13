@@ -64,9 +64,11 @@ describe('reconcileStorage', () => {
       { key: 'doc/a', size: 100 },
       { key: 'meta/a.json', size: 20 },
       { key: 'img/b.webp', size: 300 },
+      { key: 'pending/c', size: 900 },
+      { key: 'img/b.ocr.json', size: 20 },
     ])
     await reconcileStorage(asKV(kv), asR2(r2))
-    expect(await getStorageUsed(asKV(kv))).toBe(420)
+    expect(await getStorageUsed(asKV(kv))).toBe(400)
   })
 
   it('pages through a bucket larger than one list call', async () => {

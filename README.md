@@ -5,8 +5,8 @@ short URL → auto-deletes in 24h. Built for handing files to coding agents.
 
 - **Images** are re-encoded in the browser and posted through the Worker (small
   payloads), with optional Gemini OCR — exactly like `seeshare`. Output format is
-  selectable: **WEBP** (default, lossy, small) or **PNG** (lossless, larger).
-  See the PNG note under Known limitations.
+  selectable: **WEBP** (default, lossy, small) or **PNG** (lossless encoding).
+  Oversized PNGs are downscaled until they fit the image cap.
 - **Any other file** (≤ 400 MB) is uploaded **straight to R2 via a presigned PUT
   URL** (the bytes never pass through the Worker) and served back as a forced
   download, so an LLM/agent can `curl` it.
@@ -64,12 +64,16 @@ export DOCSHARE_ENDPOINT=https://your.docshare.example
 - **Storage:** one R2 bucket `docshare`
   - `img/{id}.{webp,png}` — images, `img/{id}.ocr.json` — OCR sidecars
   - `doc/{id}` — uploaded files (16-char id), `meta/{id}.json` — filename/type/size
+  - `pending/{id}` — unconfirmed direct uploads; finalize copies an immutable
+    snapshot to `doc/{id}` before the share URL becomes readable
 - **TTL:** R2 lifecycle rule deletes objects > 1 day old (see setup)
 - **Large uploads:** presigned S3 PUT direct to R2, bypassing the Worker's
   ~100 MB request-body limit. Requires an R2 S3-API token.
 - **Abuse control:**
   - burst: Cloudflare rate-limit bindings (images 6/60s, docs 2/60s, OCR 3/60s)
-  - sustained: KV per-IP daily caps (deployed: 10 docs/day, 1.5 GB/day) — `src/ratelimit.ts`
+  - sustained: one SQLite-backed Durable Object serializes admission, quota
+    charges/refunds, deletes, and storage reconciliation. Daily caps count only
+    completed documents and their actual bytes (10 docs/day, 1.5 GB/day).
 - **Security:** docs are always served `Content-Disposition: attachment` +
   `X-Content-Type-Options: nosniff` so a malicious `.html`/`.svg` can't run on
   this origin.
@@ -98,11 +102,13 @@ endpoint, so the bucket needs a CORS policy. It's in `cors.json` (wrangler's
 npx wrangler r2 bucket cors set docshare --file cors.json
 ```
 
-### 4. KV namespace for daily quotas
-```sh
-npx wrangler kv namespace create QUOTA
-```
-Paste the returned `id` into `wrangler.toml` (`[[kv_namespaces]] id = "..."`).
+### 4. Durable upload ledger
+The `LEDGER` binding and `v1-upload-ledger` SQLite migration in `wrangler.toml`
+create the ledger on deployment; no KV namespace is needed. Existing deployments
+must cut over at a UTC daily reset, after allowing old presigned URLs to expire
+(five minutes without new presigns), so the new daily counters start cleanly.
+Old completed files remain readable; unconfirmed old uploads must be restarted.
+The ledger initializes published-file storage usage from R2 on first use.
 
 ### 5. Account id
 Put your Cloudflare account id into `R2_ACCOUNT_ID` in `wrangler.toml`
@@ -169,7 +175,7 @@ bucket + token + CORS must exist for doc uploads to work locally.
 | `POST /api/ocr/:id` | OCR an image (cached); `ocr_disabled` if no Gemini key |
 | `PUT /upload/:filename` | one-shot upload ≤ 100 MB; bare URL back, or JSON `{ id, url, rawUrl, expiresAt, ... }` with `Accept: application/json` |
 | `POST /api/doc/presign` | body `{ filename, size, contentType, makeRoom? }` → `{ id, putUrl, downloadUrl, rawUrl, ... }` |
-| `POST /api/doc/finalize` | body `{ id }` — confirms upload, enforces max size |
+| `POST /api/doc/finalize` | body `{ id }` — required; publishes immutable bytes and enforces actual-size quotas |
 | `GET /d/:id/:filename` | streams a doc as a forced download |
 | `GET /api/info/:id` | metadata for an image or doc |
 | `GET /api/mine` | uploads the caller can claim — see Ownership below |
@@ -200,11 +206,10 @@ Only uploads made with the caller's `x-owner-token` are candidates. Untagged
 uploads that `/api/mine` matches by IP are never deleted this way, and the
 admin key does not widen the set. A call without a token gets
 `400 owner_token_required`.
-For the daily caps, only docs uploaded today from the caller's IP count,
-because only those refund that counter. Presigned uploads abandoned for over
-30 minutes count too. When the caller's uploads cannot free enough, the
-request returns `409 cannot_make_room` with the `shortfall` and deletes
-nothing.
+For daily caps, only completed docs uploaded today from the caller's IP count,
+because only those refund that counter. Presigning without completing an upload
+never consumes daily quota. When the caller's uploads cannot free enough, the
+request returns `409 cannot_make_room` with the `shortfall` and deletes nothing.
 
 Deleting a doc uploaded today refunds the daily quota to the counter that paid
 for it. The refund applies when the caller has the same IP or the same owner
@@ -240,12 +245,12 @@ The values actually deployed live in `wrangler.toml`.
 | Var | Default | What |
 |---|---|---|
 | `TTL_HOURS` | `24` | "expires at" shown to clients. **Actual delete is the R2 lifecycle rule** — keep in sync. |
-| `MAX_UPLOAD_BYTES` | 15 MB | image cap, per encoded image (see PNG note below) |
+| `MAX_UPLOAD_BYTES` | 15 MB | image cap, per encoded image; PNG is downscaled to fit |
 | `MAX_DOC_BYTES` | 100 MB | doc cap (deployed: 400 MB) |
 | `MAX_ADMIN_DOC_BYTES` | 1.46 GB | doc cap for requests carrying the admin key |
 | `DOC_DAILY_COUNT` | `10` | docs per IP per day |
 | `DOC_DAILY_BYTES` | 1.5 GB | doc bytes per IP per day |
-| `MAX_TOTAL_BYTES` | 9 GB | global storage hard cap (R2 free tier is 10 GB) |
+| `MAX_TOTAL_BYTES` | 9 GB | global published-file byte cap; excludes staging and sidecars |
 
 ## Tests
 
@@ -258,25 +263,22 @@ npm run check       # both; this is what CI runs
 The suite covers the accounting logic (daily quota charge/refund, the global
 storage counter and its cron reconciliation), the header/filename/range helpers,
 ownership matching, the make-room planner, and the upload/delete/make-room
-routes end to end. It uses in-memory KV/R2 fakes (`test/fakes.ts`,
-`test/app-fakes.ts`) — no Workers runtime and no network, so it runs in well
-under a second.
+routes end to end, including concurrent admission and PNG dimension fallback.
+It uses in-memory durable-storage/R2 fakes (`test/fakes.ts`, `test/app-fakes.ts`)
+without a Workers runtime or network.
 
 ## Known limitations
 
-- Daily caps are charged at presign time using the **declared** size, and KV is
-  eventually consistent — so the per-IP cap is approximate, not exact. The 60s
-  burst binding covers the concurrent case; `finalize` deletes any object that
-  came in over `MAX_DOC_BYTES`.
-- A client that presigns but never PUTs still consumes one count/declared-bytes
-  for the day, until `make-room` reclaims it (after 30 minutes) or the day
-  rolls over. The TTL lifecycle rule bounds any orphaned storage.
-- **PNG output and the 15 MB image cap.** `MAX_UPLOAD_BYTES` was sized for lossy
-  WebP. PNG is lossless, so there is no quality knob to walk down: the encoder
-  is single-shot and a large screenshot can exceed the cap outright, failing
-  with "switch to WEBP" rather than degrading. Raising the cap for PNG only, or
-  reducing `MAX_DIMENSION` for PNG, would both work — neither is implemented.
-- **Quotas are format-blind.** The per-IP daily byte cap and the 9 GB global cap
-  count bytes without regard to format, and PNG is several times larger per
-  image than WebP. Sustained PNG use burns quota much faster than the limits
-  were tuned for.
+- **Direct-upload staging is temporary, not published storage.** Signed PUTs
+  bind `Content-Length` to the declared size; changing it invalidates the URL.
+  Finalize checks the actual R2 object size and the exact daily/storage counters,
+  then publishes a snapshot that cannot be overwritten by the upload URL.
+  Pending bytes and metadata/OCR sidecars are not included in `MAX_TOTAL_BYTES`;
+  abandoned or replayed staging uploads remain until the R2 lifecycle deletes
+  them. The published-file cap is not a hard cap on physical R2 billing usage.
+- **PNG resizing changes dimensions.** Encoding remains PNG, but large images
+  are downscaled to fit 15 MB rather than rejected. Select WebP if preserving
+  more pixels matters more than lossless encoding.
+- **Quotas are format-blind.** Stored file byte caps count bytes regardless of
+  format. PNG generally uses more storage than WebP; images are not charged
+  against the daily document quota.
